@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "BrowserFileInjector": {
+      "commandName": "Project",
+      "commandLineArgs": "C:\\src\\brxxfs-simulators\\main\\src\\c"
+    }
+  }
+}
