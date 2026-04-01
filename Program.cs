@@ -18,7 +18,12 @@ namespace CliFileInjector
         // ------------------------------------------------------------------
         // Feature Flag: enable or disable global hotkey (Ctrl + Alt + F)
         // ------------------------------------------------------------------
-        private static readonly bool ENABLE_GLOBAL_HOTKEY = true;
+        private static readonly bool ENABLE_GLOBAL_HOTKEY = false;
+
+        // ------------------------------------------------------------------
+        // Chunk size limit for injection (in bytes, UTF-8)
+        // ------------------------------------------------------------------
+        private const int MAX_CHUNK_BYTES = 37 * 1024; // 40 KB
 
         // ------------------------------------------------------------------
         // P/INVOKE AND WIN32 API (For Global Hotkey and Foreground Window)
@@ -61,24 +66,156 @@ namespace CliFileInjector
             ".pdb", ".obj"
         };
 
-        // Flow control variable for the hotkey
         private static bool _hotkeyTriggered = false;
+
+        // ------------------------------------------------------------------
+        // CHUNK BUILDER
+        //
+        // Strategy:
+        //   1. Convert every file into one or more "segments" (strings that
+        //      individually fit within MAX_CHUNK_BYTES, including their
+        //      Start/End markers).
+        //   2. Greedily pack ALL segments (from any file) into chunks.
+        //      This means part-2 of FileA and all of FileB can share a chunk
+        //      if the combined size fits.
+        // ------------------------------------------------------------------
+        private record FileEntry(string FileName, string Content, bool IsText);
+
+        private static int Utf8Bytes(string s) => Encoding.UTF8.GetByteCount(s);
+
+        private static List<string> BuildChunks(List<FileEntry> entries)
+        {
+            // Step 1 — produce a flat list of segments from all files
+            var allSegments = new List<string>();
+
+            foreach (var entry in entries)
+            {
+                if (!entry.IsText)
+                {
+                    allSegments.Add(
+                        $"[Context Note: The binary/non-text file '{entry.FileName}' exists in the directory, but its content was omitted.]\n\n");
+                    continue;
+                }
+
+                string fileContent = entry.Content.Replace("\r\n", "\n");
+
+                // Use the worst-case marker size (part 999 of 999) so the
+                // content budget is always safe regardless of the final label.
+                string worstHeader = $"--- Start of '{entry.FileName}' (part 999 of 999) ---\n";
+                string worstFooter = $"\n--- End of '{entry.FileName}' (part 999 of 999) ---\n\n";
+                int markerBytes = Utf8Bytes(worstHeader) + Utf8Bytes(worstFooter);
+                int budget = MAX_CHUNK_BYTES - markerBytes;
+                if (budget <= 0) budget = MAX_CHUNK_BYTES / 2;
+
+                // Split file content into groups that each fit within budget
+                var groups = new List<string>();
+                var cur = new StringBuilder();
+                int curBytes = 0;
+
+                foreach (string line in fileContent.Split('\n'))
+                {
+                    string lineNl = line + "\n";
+                    int lineBytes = Utf8Bytes(lineNl);
+
+                    if (lineBytes > budget)
+                    {
+                        // Single line exceeds budget — flush and hard-cut
+                        if (cur.Length > 0) { groups.Add(cur.ToString()); cur.Clear(); curBytes = 0; }
+                        string remaining = lineNl;
+                        while (remaining.Length > 0)
+                        {
+                            int take = TakeUpToBytes(remaining, budget);
+                            groups.Add(remaining[..take]);
+                            remaining = remaining[take..];
+                        }
+                        continue;
+                    }
+
+                    if (curBytes + lineBytes > budget && cur.Length > 0)
+                    {
+                        groups.Add(cur.ToString()); cur.Clear(); curBytes = 0;
+                    }
+
+                    cur.Append(lineNl);
+                    curBytes += lineBytes;
+                }
+
+                if (cur.Length > 0) groups.Add(cur.ToString());
+
+                // Wrap each group with the correct (part N of M) label
+                int totalParts = groups.Count;
+                for (int i = 0; i < totalParts; i++)
+                {
+                    string partLabel = totalParts > 1 ? $" (part {i + 1} of {totalParts})" : string.Empty;
+                    string header = $"--- Start of '{entry.FileName}'{partLabel} ---\n";
+                    string footer = $"\n--- End of '{entry.FileName}'{partLabel} ---\n\n";
+                    allSegments.Add(header + groups[i] + footer);
+                }
+            }
+
+            // Step 2 — greedily pack all segments into chunks
+            var chunks = new List<string>();
+            var chunkBuilder = new StringBuilder();
+            int chunkBytes = 0;
+
+            void Flush()
+            {
+                if (chunkBuilder.Length > 0)
+                {
+                    chunks.Add(chunkBuilder.ToString());
+                    chunkBuilder.Clear();
+                    chunkBytes = 0;
+                }
+            }
+
+            foreach (string seg in allSegments)
+            {
+                int segBytes = Utf8Bytes(seg);
+
+                if (segBytes > MAX_CHUNK_BYTES)
+                {
+                    // Segment is intrinsically oversized — send alone
+                    Flush();
+                    chunks.Add(seg);
+                    continue;
+                }
+
+                if (chunkBytes + segBytes > MAX_CHUNK_BYTES)
+                    Flush();
+
+                chunkBuilder.Append(seg);
+                chunkBytes += segBytes;
+            }
+
+            Flush();
+            return chunks;
+        }
+
+        // Returns how many leading characters of s fit within maxBytes in UTF-8.
+        private static int TakeUpToBytes(string s, int maxBytes)
+        {
+            int bytes = 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                int cb = Encoding.UTF8.GetByteCount(s, i, 1);
+                if (bytes + cb > maxBytes) return i;
+                bytes += cb;
+            }
+            return s.Length;
+        }
 
         static async Task Main(string[] args)
         {
             Console.OutputEncoding = System.Text.Encoding.UTF8;
             Console.InputEncoding = System.Text.Encoding.UTF8;
 
-            // Working directory: where you want to browse files (project/source folder)
             string workingDirectory =
                 args.Length > 0 && Directory.Exists(args[0])
                     ? args[0]
                     : Directory.GetCurrentDirectory();
 
-            // EXE directory: where BrowserFileInjector.exe and appsettings.json live
             string exeDirectory = AppDomain.CurrentDomain.BaseDirectory;
 
-            // Start global hotkey listener only if enabled
             Thread? hookThread = null;
             if (ENABLE_GLOBAL_HOTKEY)
             {
@@ -92,7 +229,6 @@ namespace CliFileInjector
                 AnsiConsole.MarkupLine("[yellow]Global hotkey is DISABLED. Use Enter in the console instead.[/]");
             }
 
-            // 1. Load configuration from appsettings.json (from EXE folder)
             IConfiguration config = new ConfigurationBuilder()
                 .SetBasePath(exeDirectory)
                 .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
@@ -105,7 +241,6 @@ namespace CliFileInjector
                 return;
             }
 
-            // 2. Initialize Playwright and connect to Edge via CDP
             AnsiConsole.MarkupLine("[blue]Connecting to Edge via CDP (port 9222)...[/]");
             using var playwright = await Playwright.CreateAsync();
             var browser = await playwright.Chromium.ConnectOverCDPAsync("http://localhost:9222");
@@ -113,30 +248,24 @@ namespace CliFileInjector
 
             AnsiConsole.MarkupLine("[green]Service ready.[/]");
             if (ENABLE_GLOBAL_HOTKEY)
-            {
                 AnsiConsole.MarkupLine("Press [yellow]Ctrl + Alt + F[/] from anywhere to inject files.");
-            }
 
-            // 3. Main loop
             while (true)
             {
                 if (ENABLE_GLOBAL_HOTKEY)
                 {
-                    // Wait for global hotkey
                     if (!_hotkeyTriggered)
                     {
                         await Task.Delay(100);
                         continue;
                     }
 
-                    // Hotkey pressed
                     _hotkeyTriggered = false;
                     SetForegroundWindow(GetConsoleWindow());
                     Console.Clear();
                 }
                 else
                 {
-                    // Manual trigger from console
                     AnsiConsole.MarkupLine("\nPress [yellow]Enter[/] to open the file browser, or [grey]Esc[/] to exit.");
                     var key = Console.ReadKey(intercept: true);
                     if (key.Key == ConsoleKey.Escape)
@@ -145,15 +274,13 @@ namespace CliFileInjector
                         continue;
                 }
 
-                // 3.1 Detect active LLM sessions in current Edge context
+                // 3.1 Detect active LLM sessions
                 var activeSessions = new List<(IPage Page, LlmConfig Config)>();
                 foreach (var page in context.Pages)
                 {
                     var match = supportedModels.FirstOrDefault(m => page.Url.Contains(m.UrlSubstring));
                     if (match != null && !activeSessions.Any(s => s.Config.Name == match.Name))
-                    {
                         activeSessions.Add((Page: page, Config: match));
-                    }
                 }
 
                 if (activeSessions.Count == 0)
@@ -164,7 +291,7 @@ namespace CliFileInjector
 
                 AnsiConsole.MarkupLine($"[green]{activeSessions.Count} LLM session(s) detected.[/]");
 
-                // 3.2 Open interactive file browser starting at workingDirectory
+                // 3.2 File browser
                 var selectedFilePaths = InteractiveFileBrowser(workingDirectory);
                 if (selectedFilePaths.Count == 0)
                 {
@@ -172,32 +299,24 @@ namespace CliFileInjector
                     continue;
                 }
 
-                // 3.3 Build the payload from selected files
-                var payloadBuilder = new StringBuilder();
-                payloadBuilder.AppendLine();
-
+                // 3.3 Build file entries
+                var fileEntries = new List<FileEntry>();
                 foreach (var filePath in selectedFilePaths)
                 {
                     string fileName = Path.GetFileName(filePath);
-
-                    if (IsTextFile(filePath))
-                    {
-                        payloadBuilder.AppendLine($"--- Start of {fileName} ---");
-                        payloadBuilder.AppendLine(File.ReadAllText(filePath).Replace("\r\n", "\n"));
-                        payloadBuilder.AppendLine($"--- End of {fileName} ---");
-                        payloadBuilder.AppendLine();
-                    }
-                    else
-                    {
-                        payloadBuilder.AppendLine(
-                            $"[Context Note: The binary/non-text file '{fileName}' exists in the directory, but its content was omitted.]");
-                        payloadBuilder.AppendLine();
-                    }
+                    bool isText = IsTextFile(filePath);
+                    string content = isText ? File.ReadAllText(filePath) : string.Empty;
+                    fileEntries.Add(new FileEntry(fileName, content, isText));
                 }
 
-                string payload = payloadBuilder.ToString();
+                // 3.4 Build chunks
+                List<string> chunks = BuildChunks(fileEntries);
+                int totalChunks = chunks.Count;
 
-                // 3.4 Choose target LLM(s)
+                if (totalChunks > 1)
+                    AnsiConsole.MarkupLine($"[yellow]Payload exceeds {MAX_CHUNK_BYTES / 1024} KB — will be sent in {totalChunks} chunk(s).[/]");
+
+                // 3.5 Choose target LLM(s)
                 var targets = new List<(IPage Page, LlmConfig Config)>();
                 if (activeSessions.Count == 1)
                 {
@@ -214,30 +333,53 @@ namespace CliFileInjector
                             .AddChoices(choices));
 
                     if (selectedTarget == "All active sessions")
-                    {
                         targets.AddRange(activeSessions);
-                    }
                     else
-                    {
                         targets.Add(activeSessions.First(s => s.Config.Name == selectedTarget));
-                    }
                 }
 
-                // 3.5 Inject into selected targets
-                foreach (var target in targets)
+                // 3.6 Inject chunks
+                for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
                 {
-                    try
-                    {
-                        await target.Page.BringToFrontAsync();
-                        var locator = target.Page.Locator(target.Config.TextAreaSelector).First;
-                        await locator.FocusAsync();
-                        await target.Page.Keyboard.InsertTextAsync(payload);
+                    if (totalChunks > 1)
+                        AnsiConsole.MarkupLine($"\n[blue]Injecting chunk {chunkIndex + 1} of {totalChunks}...[/]");
 
-                        AnsiConsole.MarkupLine($"[green]✔ Injected into {target.Config.Name}![/]");
-                    }
-                    catch (Exception ex)
+                    foreach (var target in targets)
                     {
-                        AnsiConsole.MarkupLine($"[red]Error injecting into {target.Config.Name}: {ex.Message}[/]");
+                        try
+                        {
+                            await target.Page.BringToFrontAsync();
+                            var locator = target.Page.Locator(target.Config.TextAreaSelector).First;
+                            await locator.FocusAsync();
+                            await target.Page.Keyboard.InsertTextAsync(chunks[chunkIndex]);
+                            AnsiConsole.MarkupLine($"[green]✔ Injected into {target.Config.Name}![/]");
+                        }
+                        catch (Exception ex)
+                        {
+                            AnsiConsole.MarkupLine($"[red]Error injecting into {target.Config.Name}: {ex.Message}[/]");
+                        }
+                    }
+
+                    if (chunkIndex < totalChunks - 1)
+                    {
+                        SetForegroundWindow(GetConsoleWindow());
+                        AnsiConsole.MarkupLine(
+                            $"\n[yellow]Chunk {chunkIndex + 1}/{totalChunks} injected.[/] " +
+                            "Press [green]Enter[/] to send the next chunk, or [red]Esc[/] to abort.");
+
+                        bool aborted = false;
+                        while (true)
+                        {
+                            var k = Console.ReadKey(intercept: true);
+                            if (k.Key == ConsoleKey.Enter) break;
+                            if (k.Key == ConsoleKey.Escape) { aborted = true; break; }
+                        }
+
+                        if (aborted)
+                        {
+                            AnsiConsole.MarkupLine("[red]Injection aborted by user.[/]");
+                            break;
+                        }
                     }
                 }
 
@@ -252,14 +394,9 @@ namespace CliFileInjector
         {
             using var window = new Form();
             var handle = window.Handle;
-
-            // Register Ctrl + Alt + F
             RegisterHotKey(handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_F);
-
-            // Use fully qualified name to avoid ambiguity
             System.Windows.Forms.Application.AddMessageFilter(new HotKeyMessageFilter());
             System.Windows.Forms.Application.Run();
-
             UnregisterHotKey(handle, HOTKEY_ID);
         }
 
@@ -294,9 +431,7 @@ namespace CliFileInjector
                 {
                     AnsiConsole.MarkupLine("\n[green]Currently Selected for Injection:[/]");
                     foreach (var item in cart)
-                    {
                         AnsiConsole.MarkupLine($" - {Path.GetFileName(item)}");
-                    }
                 }
                 else
                 {
@@ -310,19 +445,14 @@ namespace CliFileInjector
                 var choices = new List<string>();
 
                 if (cart.Count > 0)
-                {
                     choices.Add("[green]✓ CONFIRM AND INJECT[/]");
-                }
 
                 var parentDir = Directory.GetParent(currentPath);
                 if (parentDir != null)
-                {
                     choices.Add("[blue].. (Go up one folder)[/]");
-                }
 
                 foreach (var dir in dirs)
                 {
-                    // If the directory is already in the cart, display it differently
                     string fullDir = Path.Combine(currentPath, dir!);
                     string displayed = cart.Contains(fullDir) ? $"[green]✓ 📁 {dir}[/]" : $"[blue]📁 {dir}[/]";
                     choices.Add(displayed);
@@ -344,20 +474,15 @@ namespace CliFileInjector
 
                 var selected = AnsiConsole.Prompt(prompt);
 
-                // Action 1: Inject everything
                 if (selected == "[green]✓ CONFIRM AND INJECT[/]")
                 {
                     var finalFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
                     foreach (var path in cart)
                     {
                         if (Directory.Exists(path))
                         {
-                            var allFilesInDir = Directory.GetFiles(path, "*.*", SearchOption.AllDirectories);
-                            foreach (var f in allFilesInDir)
-                            {
+                            foreach (var f in Directory.GetFiles(path, "*.*", SearchOption.AllDirectories))
                                 if (IsTextFile(f)) finalFiles.Add(f);
-                            }
                         }
                         else if (File.Exists(path))
                         {
@@ -367,21 +492,18 @@ namespace CliFileInjector
                     return finalFiles.ToList();
                 }
 
-                // Action 2: Go back a directory
                 if (selected == "[blue].. (Go up one folder)[/]" && parentDir != null)
                 {
                     currentPath = parentDir.FullName;
                     continue;
                 }
 
-                // Action 3: Is this a directory (Enter or Check/Uncheck?)
                 if (displayToFile.TryGetValue(selected, out string? selectedName))
                 {
                     string fullPath = Path.Combine(currentPath, selectedName);
 
                     if (Directory.Exists(fullPath))
                     {
-                        // If the user has selected a directory, we ask if they want to enter or select the directory
                         var dirAction = AnsiConsole.Prompt(
                             new SelectionPrompt<string>()
                                 .Title($"What do you want to do with [blue]📁 {selectedName}[/]?")
@@ -389,17 +511,12 @@ namespace CliFileInjector
                         ) ?? string.Empty;
 
                         if (dirAction == "Open Folder")
-                        {
                             currentPath = fullPath;
-                        }
                         else if (dirAction == "Toggle Selection (Select/Deselect for Injection)")
-                        {
                             if (!cart.Add(fullPath)) cart.Remove(fullPath);
-                        }
                     }
                     else
                     {
-                        // It's a file. Just toggle it on or off in the cart
                         if (!cart.Add(fullPath)) cart.Remove(fullPath);
                     }
                 }
@@ -409,24 +526,16 @@ namespace CliFileInjector
         private static bool IsTextFile(string filePath)
         {
             string ext = Path.GetExtension(filePath);
-            if (TextExtensions.Contains(ext))
-                return true;
-
-            if (BinaryExtensions.Contains(ext))
-                return false;
+            if (TextExtensions.Contains(ext)) return true;
+            if (BinaryExtensions.Contains(ext)) return false;
 
             try
             {
                 using var stream = File.OpenRead(filePath);
                 byte[] buffer = new byte[512];
                 int bytesRead = stream.Read(buffer, 0, buffer.Length);
-
                 for (int i = 0; i < bytesRead; i++)
-                {
-                    if (buffer[i] == 0)
-                        return false;
-                }
-
+                    if (buffer[i] == 0) return false;
                 return true;
             }
             catch
