@@ -1,5 +1,6 @@
 ﻿using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Playwright;
 using Spectre.Console;
@@ -11,6 +12,7 @@ namespace CliFileInjector
         public string Name { get; set; } = string.Empty;
         public string UrlSubstring { get; set; } = string.Empty;
         public string TextAreaSelector { get; set; } = string.Empty;
+        public bool UsesContentEditable { get; set; }
     }
 
     class Program
@@ -23,7 +25,7 @@ namespace CliFileInjector
         // ------------------------------------------------------------------
         // Chunk size limit for injection (in bytes, UTF-8)
         // ------------------------------------------------------------------
-        private const int MAX_CHUNK_BYTES = 37 * 1024; // 40 KB
+        private const int MAX_CHUNK_BYTES = 37 * 1024; // 37 KB
 
         // ------------------------------------------------------------------
         // P/INVOKE AND WIN32 API (For Global Hotkey and Foreground Window)
@@ -70,14 +72,6 @@ namespace CliFileInjector
 
         // ------------------------------------------------------------------
         // CHUNK BUILDER
-        //
-        // Strategy:
-        //   1. Convert every file into one or more "segments" (strings that
-        //      individually fit within MAX_CHUNK_BYTES, including their
-        //      Start/End markers).
-        //   2. Greedily pack ALL segments (from any file) into chunks.
-        //      This means part-2 of FileA and all of FileB can share a chunk
-        //      if the combined size fits.
         // ------------------------------------------------------------------
         private record FileEntry(string FileName, string Content, bool IsText);
 
@@ -85,7 +79,6 @@ namespace CliFileInjector
 
         private static List<string> BuildChunks(List<FileEntry> entries)
         {
-            // Step 1 — produce a flat list of segments from all files
             var allSegments = new List<string>();
 
             foreach (var entry in entries)
@@ -99,15 +92,12 @@ namespace CliFileInjector
 
                 string fileContent = entry.Content.Replace("\r\n", "\n");
 
-                // Use the worst-case marker size (part 999 of 999) so the
-                // content budget is always safe regardless of the final label.
                 string worstHeader = $"--- Start of '{entry.FileName}' (part 999 of 999) ---\n";
                 string worstFooter = $"\n--- End of '{entry.FileName}' (part 999 of 999) ---\n\n";
                 int markerBytes = Utf8Bytes(worstHeader) + Utf8Bytes(worstFooter);
                 int budget = MAX_CHUNK_BYTES - markerBytes;
                 if (budget <= 0) budget = MAX_CHUNK_BYTES / 2;
 
-                // Split file content into groups that each fit within budget
                 var groups = new List<string>();
                 var cur = new StringBuilder();
                 int curBytes = 0;
@@ -119,8 +109,13 @@ namespace CliFileInjector
 
                     if (lineBytes > budget)
                     {
-                        // Single line exceeds budget — flush and hard-cut
-                        if (cur.Length > 0) { groups.Add(cur.ToString()); cur.Clear(); curBytes = 0; }
+                        if (cur.Length > 0)
+                        {
+                            groups.Add(cur.ToString());
+                            cur.Clear();
+                            curBytes = 0;
+                        }
+
                         string remaining = lineNl;
                         while (remaining.Length > 0)
                         {
@@ -133,16 +128,18 @@ namespace CliFileInjector
 
                     if (curBytes + lineBytes > budget && cur.Length > 0)
                     {
-                        groups.Add(cur.ToString()); cur.Clear(); curBytes = 0;
+                        groups.Add(cur.ToString());
+                        cur.Clear();
+                        curBytes = 0;
                     }
 
                     cur.Append(lineNl);
                     curBytes += lineBytes;
                 }
 
-                if (cur.Length > 0) groups.Add(cur.ToString());
+                if (cur.Length > 0)
+                    groups.Add(cur.ToString());
 
-                // Wrap each group with the correct (part N of M) label
                 int totalParts = groups.Count;
                 for (int i = 0; i < totalParts; i++)
                 {
@@ -153,7 +150,6 @@ namespace CliFileInjector
                 }
             }
 
-            // Step 2 — greedily pack all segments into chunks
             var chunks = new List<string>();
             var chunkBuilder = new StringBuilder();
             int chunkBytes = 0;
@@ -174,7 +170,6 @@ namespace CliFileInjector
 
                 if (segBytes > MAX_CHUNK_BYTES)
                 {
-                    // Segment is intrinsically oversized — send alone
                     Flush();
                     chunks.Add(seg);
                     continue;
@@ -191,7 +186,6 @@ namespace CliFileInjector
             return chunks;
         }
 
-        // Returns how many leading characters of s fit within maxBytes in UTF-8.
         private static int TakeUpToBytes(string s, int maxBytes)
         {
             int bytes = 0;
@@ -206,15 +200,17 @@ namespace CliFileInjector
 
         static async Task Main(string[] args)
         {
-            Console.OutputEncoding = System.Text.Encoding.UTF8;
-            Console.InputEncoding = System.Text.Encoding.UTF8;
+            Console.OutputEncoding = Encoding.UTF8;
+            Console.InputEncoding = Encoding.UTF8;
 
             string workingDirectory =
                 args.Length > 0 && Directory.Exists(args[0])
                     ? args[0]
                     : Directory.GetCurrentDirectory();
 
+            string lastBrowserDirectory = workingDirectory;
             string exeDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            List<string> directoryFilterPatterns = new();
 
             Thread? hookThread = null;
             if (ENABLE_GLOBAL_HOTKEY)
@@ -266,19 +262,29 @@ namespace CliFileInjector
                 }
                 else
                 {
-                    AnsiConsole.MarkupLine("\nPress [yellow]Enter[/] to open the file browser, or [grey]Esc[/] to exit.");
+                    AnsiConsole.MarkupLine($"\n[grey]Directory filter:[/] {FormatDirectoryFilter(directoryFilterPatterns)}");
+                    AnsiConsole.MarkupLine("Press [yellow]Enter[/] to open the file browser, [yellow]*[/] to configure directory filter, or [grey]Esc[/] to exit.");
+
                     var key = Console.ReadKey(intercept: true);
+
                     if (key.Key == ConsoleKey.Escape)
                         break;
+
+                    if (key.KeyChar == '*')
+                    {
+                        directoryFilterPatterns = PromptDirectoryFilterPatterns(directoryFilterPatterns);
+                        Console.Clear();
+                        continue;
+                    }
+
                     if (key.Key != ConsoleKey.Enter)
                         continue;
                 }
 
-                // 3.1 Detect active LLM sessions
                 var activeSessions = new List<(IPage Page, LlmConfig Config)>();
                 foreach (var page in context.Pages)
                 {
-                    var match = supportedModels.FirstOrDefault(m => page.Url.Contains(m.UrlSubstring));
+                    var match = supportedModels.FirstOrDefault(m => page.Url.Contains(m.UrlSubstring, StringComparison.OrdinalIgnoreCase));
                     if (match != null && !activeSessions.Any(s => s.Config.Name == match.Name))
                         activeSessions.Add((Page: page, Config: match));
                 }
@@ -291,15 +297,29 @@ namespace CliFileInjector
 
                 AnsiConsole.MarkupLine($"[green]{activeSessions.Count} LLM session(s) detected.[/]");
 
-                // 3.2 File browser
-                var selectedFilePaths = InteractiveFileBrowser(workingDirectory);
-                if (selectedFilePaths.Count == 0)
+                var (selectedFilePaths, lastVisitedDirectory, cancelled) = InteractiveFileBrowser(
+                    lastBrowserDirectory,
+                    directoryFilterPatterns);
+
+                if (cancelled)
                 {
-                    AnsiConsole.MarkupLine("[yellow]No files selected. Back to standby.[/]");
+                    lastBrowserDirectory = lastVisitedDirectory;
+                    AnsiConsole.MarkupLine("[yellow]File browser cancelled. Back to idle.[/]");
                     continue;
                 }
 
-                // 3.3 Build file entries
+                if (selectedFilePaths.Count == 0)
+                {
+                    lastBrowserDirectory = lastVisitedDirectory;
+                    AnsiConsole.MarkupLine("[yellow]No files matched the current selection/filter. Back to idle.[/]");
+                    continue;
+                }
+
+                lastBrowserDirectory = ResolveNextBrowserDirectory(
+                    selectedFilePaths,
+                    lastVisitedDirectory,
+                    lastBrowserDirectory);
+
                 var fileEntries = new List<FileEntry>();
                 foreach (var filePath in selectedFilePaths)
                 {
@@ -309,14 +329,12 @@ namespace CliFileInjector
                     fileEntries.Add(new FileEntry(fileName, content, isText));
                 }
 
-                // 3.4 Build chunks
                 List<string> chunks = BuildChunks(fileEntries);
                 int totalChunks = chunks.Count;
 
                 if (totalChunks > 1)
                     AnsiConsole.MarkupLine($"[yellow]Payload exceeds {MAX_CHUNK_BYTES / 1024} KB — will be sent in {totalChunks} chunk(s).[/]");
 
-                // 3.5 Choose target LLM(s)
                 var targets = new List<(IPage Page, LlmConfig Config)>();
                 if (activeSessions.Count == 1)
                 {
@@ -338,7 +356,6 @@ namespace CliFileInjector
                         targets.Add(activeSessions.First(s => s.Config.Name == selectedTarget));
                 }
 
-                // 3.6 Inject chunks
                 for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
                 {
                     if (totalChunks > 1)
@@ -372,7 +389,11 @@ namespace CliFileInjector
                         {
                             var k = Console.ReadKey(intercept: true);
                             if (k.Key == ConsoleKey.Enter) break;
-                            if (k.Key == ConsoleKey.Escape) { aborted = true; break; }
+                            if (k.Key == ConsoleKey.Escape)
+                            {
+                                aborted = true;
+                                break;
+                            }
                         }
 
                         if (aborted)
@@ -385,6 +406,126 @@ namespace CliFileInjector
 
                 AnsiConsole.MarkupLine("\n[grey]Done. Trigger again when you need another injection.[/]");
             }
+        }
+
+        private static string ResolveNextBrowserDirectory(
+            List<string> selectedFilePaths,
+            string lastVisitedDirectory,
+            string fallbackDirectory)
+        {
+            if (selectedFilePaths == null || selectedFilePaths.Count == 0)
+                return !string.IsNullOrWhiteSpace(lastVisitedDirectory) ? lastVisitedDirectory : fallbackDirectory;
+
+            var directories = selectedFilePaths
+                .Select(Path.GetDirectoryName)
+                .Where(d => !string.IsNullOrWhiteSpace(d))
+                .Select(d => d!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (directories.Count == 0)
+                return !string.IsNullOrWhiteSpace(lastVisitedDirectory) ? lastVisitedDirectory : fallbackDirectory;
+
+            if (directories.Count == 1)
+                return directories[0];
+
+            return !string.IsNullOrWhiteSpace(lastVisitedDirectory) ? lastVisitedDirectory : fallbackDirectory;
+        }
+
+        private static List<string> PromptDirectoryFilterPatterns(List<string> currentPatterns)
+        {
+            Console.Clear();
+            AnsiConsole.MarkupLine("[blue]Directory filter configuration[/]");
+            AnsiConsole.MarkupLine($"[grey]Current filter:[/] {FormatDirectoryFilter(currentPatterns)}");
+            AnsiConsole.MarkupLine("[grey]Examples:[/] .c*, .json, .bak.txt");
+            AnsiConsole.MarkupLine("[grey]Notes:[/] applies only to selected directories; individually selected files always bypass the filter.");
+            AnsiConsole.MarkupLine("[grey]Leave empty, or type 'clear' / 'none' to remove the filter.[/]\n");
+
+            string input = AnsiConsole.Prompt(
+                new TextPrompt<string>("Extensions / wildcard list:")
+                    .AllowEmpty());
+
+            var patterns = ParseDirectoryFilterInput(input);
+
+            if (patterns.Count == 0)
+                AnsiConsole.MarkupLine("\n[yellow]Directory filter cleared.[/]");
+            else
+                AnsiConsole.MarkupLine($"\n[green]Directory filter set to:[/] {string.Join(", ", patterns)}");
+
+            AnsiConsole.MarkupLine("[grey]Press any key to return to idle...[/]");
+            Console.ReadKey(intercept: true);
+
+            return patterns;
+        }
+
+        private static List<string> ParseDirectoryFilterInput(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input))
+                return new List<string>();
+
+            string normalized = input.Trim();
+            if (normalized.Equals("clear", StringComparison.OrdinalIgnoreCase) ||
+                normalized.Equals("none", StringComparison.OrdinalIgnoreCase))
+            {
+                return new List<string>();
+            }
+
+            return normalized
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static string FormatDirectoryFilter(List<string> patterns)
+        {
+            return patterns == null || patterns.Count == 0
+                ? "<none>"
+                : string.Join(", ", patterns);
+        }
+
+        private static bool MatchesDirectoryFilter(string filePath, List<string> patterns)
+        {
+            if (patterns == null || patterns.Count == 0)
+                return true;
+
+            string fileName = Path.GetFileName(filePath);
+
+            foreach (var pattern in patterns)
+            {
+                if (MatchesSinglePattern(fileName, pattern))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool MatchesSinglePattern(string fileName, string pattern)
+        {
+            if (string.IsNullOrWhiteSpace(fileName) || string.IsNullOrWhiteSpace(pattern))
+                return false;
+
+            string normalizedPattern = NormalizeWildcardPattern(pattern);
+            string regexPattern =
+                "^" +
+                Regex.Escape(normalizedPattern)
+                    .Replace("\\*", ".*")
+                    .Replace("\\?", ".") +
+                "$";
+
+            return Regex.IsMatch(fileName, regexPattern, RegexOptions.IgnoreCase);
+        }
+
+        private static string NormalizeWildcardPattern(string pattern)
+        {
+            string p = pattern.Trim();
+            if (string.IsNullOrWhiteSpace(p))
+                return p;
+
+            if (p.StartsWith('.'))
+                return "*" + p;
+
+            return p;
         }
 
         // ------------------------------------------------------------------
@@ -417,7 +558,9 @@ namespace CliFileInjector
         // ------------------------------------------------------------------
         // FILE BROWSER AND UTILITIES
         // ------------------------------------------------------------------
-        private static List<string> InteractiveFileBrowser(string startingPath)
+        private static (List<string> Files, string LastDirectory, bool Cancelled) InteractiveFileBrowser(
+            string startingPath,
+            List<string> directoryFilterPatterns)
         {
             string currentPath = startingPath;
             var cart = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -426,6 +569,8 @@ namespace CliFileInjector
             {
                 Console.Clear();
                 AnsiConsole.MarkupLine($"[blue]Directory:[/]\n{currentPath}");
+                AnsiConsole.MarkupLine($"[grey]Directory filter:[/] {FormatDirectoryFilter(directoryFilterPatterns)}");
+                AnsiConsole.MarkupLine("[grey]Note:[/] filter applies only to selected directories; individually selected files are always sent.");
 
                 if (cart.Count > 0)
                 {
@@ -438,8 +583,19 @@ namespace CliFileInjector
                     AnsiConsole.MarkupLine("\n[grey]Nothing selected yet.[/]");
                 }
 
-                var dirs = Directory.GetDirectories(currentPath).Select(Path.GetFileName).ToList();
-                var files = Directory.GetFiles(currentPath).Select(Path.GetFileName).ToList();
+                var dirs = Directory.GetDirectories(currentPath)
+                    .Select(Path.GetFileName)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Select(x => x!)
+                    .OrderBy(x => x)
+                    .ToList();
+
+                var files = Directory.GetFiles(currentPath)
+                    .Select(Path.GetFileName)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Select(x => x!)
+                    .OrderBy(x => x)
+                    .ToList();
 
                 var displayToFile = new Dictionary<string, string>();
                 var choices = new List<string>();
@@ -453,43 +609,64 @@ namespace CliFileInjector
 
                 foreach (var dir in dirs)
                 {
-                    string fullDir = Path.Combine(currentPath, dir!);
-                    string displayed = cart.Contains(fullDir) ? $"[green]✓ 📁 {dir}[/]" : $"[blue]📁 {dir}[/]";
+                    string fullDir = Path.Combine(currentPath, dir);
+                    string displayed = cart.Contains(fullDir)
+                        ? $"[green]✓ 📁 {dir}[/]"
+                        : $"[blue]📁 {dir}[/]";
+
                     choices.Add(displayed);
-                    displayToFile[displayed] = dir!;
+                    displayToFile[displayed] = dir;
                 }
 
                 foreach (var file in files)
                 {
-                    string fullFile = Path.Combine(currentPath, file!);
-                    string displayed = cart.Contains(fullFile) ? $"[green]✓ 📄 {file}[/]" : $"📄 {file}";
+                    string fullFile = Path.Combine(currentPath, file);
+                    string displayed = cart.Contains(fullFile)
+                        ? $"[green]✓ 📄 {file}[/]"
+                        : $"📄 {file}";
+
                     choices.Add(displayed);
-                    displayToFile[displayed] = file!;
+                    displayToFile[displayed] = file;
                 }
+
+                choices.Add("[red]← CANCEL AND RETURN[/]");
 
                 var prompt = new SelectionPrompt<string>()
                     .Title("\n[grey]Navigate with Arrows. Press [blue]Enter[/] to enter folders, select files, or toggle selection.[/]")
-                    .PageSize(15)
+                    .PageSize(20)
                     .AddChoices(choices);
 
                 var selected = AnsiConsole.Prompt(prompt);
 
+                if (selected == "[red]← CANCEL AND RETURN[/]")
+                    return (new List<string>(), currentPath, true);
+
                 if (selected == "[green]✓ CONFIRM AND INJECT[/]")
                 {
                     var finalFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
                     foreach (var path in cart)
                     {
                         if (Directory.Exists(path))
                         {
                             foreach (var f in Directory.GetFiles(path, "*.*", SearchOption.AllDirectories))
-                                if (IsTextFile(f)) finalFiles.Add(f);
+                            {
+                                if (!IsTextFile(f))
+                                    continue;
+
+                                if (!MatchesDirectoryFilter(f, directoryFilterPatterns))
+                                    continue;
+
+                                finalFiles.Add(f);
+                            }
                         }
                         else if (File.Exists(path))
                         {
                             finalFiles.Add(path);
                         }
                     }
-                    return finalFiles.ToList();
+
+                    return (finalFiles.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList(), currentPath, false);
                 }
 
                 if (selected == "[blue].. (Go up one folder)[/]" && parentDir != null)
@@ -507,17 +684,25 @@ namespace CliFileInjector
                         var dirAction = AnsiConsole.Prompt(
                             new SelectionPrompt<string>()
                                 .Title($"What do you want to do with [blue]📁 {selectedName}[/]?")
-                                .AddChoices(new[] { "Open Folder", "Toggle Selection (Select/Deselect for Injection)", "Cancel" })
-                        ) ?? string.Empty;
+                                .AddChoices(new[]
+                                {
+                                    "Open Folder",
+                                    "Toggle Selection (Select/Deselect for Injection)",
+                                    "Cancel"
+                                })) ?? string.Empty;
 
                         if (dirAction == "Open Folder")
                             currentPath = fullPath;
                         else if (dirAction == "Toggle Selection (Select/Deselect for Injection)")
-                            if (!cart.Add(fullPath)) cart.Remove(fullPath);
+                        {
+                            if (!cart.Add(fullPath))
+                                cart.Remove(fullPath);
+                        }
                     }
                     else
                     {
-                        if (!cart.Add(fullPath)) cart.Remove(fullPath);
+                        if (!cart.Add(fullPath))
+                            cart.Remove(fullPath);
                     }
                 }
             }
