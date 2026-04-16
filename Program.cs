@@ -1,4 +1,4 @@
-﻿using System.Runtime.InteropServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Configuration;
@@ -238,8 +238,27 @@ namespace CliFileInjector
             }
 
             AnsiConsole.MarkupLine("[blue]Connecting to Edge via CDP (port 9222)...[/]");
+
             using var playwright = await Playwright.CreateAsync();
-            var browser = await playwright.Chromium.ConnectOverCDPAsync("http://localhost:9222");
+            IBrowser browser;
+            try
+            {
+                browser = await playwright.Chromium.ConnectOverCDPAsync("http://localhost:9222");
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine("[red]Failed to connect to Edge via CDP.[/]");
+                AnsiConsole.MarkupLine("[grey]Make sure Edge is running with --remote-debugging-port=9222.[/]");
+                AnsiConsole.MarkupLine($"[red]Details: {Markup.Escape(ex.Message)}[/]");
+                return;
+            }
+
+            if (browser.Contexts.Count == 0)
+            {
+                AnsiConsole.MarkupLine("[red]No browser contexts found. Open at least one tab in Edge and try again.[/]");
+                return;
+            }
+
             var context = browser.Contexts[0];
 
             AnsiConsole.MarkupLine("[green]Service ready.[/]");
@@ -284,9 +303,16 @@ namespace CliFileInjector
                 var activeSessions = new List<(IPage Page, LlmConfig Config)>();
                 foreach (var page in context.Pages)
                 {
-                    var match = supportedModels.FirstOrDefault(m => page.Url.Contains(m.UrlSubstring, StringComparison.OrdinalIgnoreCase));
-                    if (match != null && !activeSessions.Any(s => s.Config.Name == match.Name))
-                        activeSessions.Add((Page: page, Config: match));
+                    try
+                    {
+                        var match = supportedModels.FirstOrDefault(m => page.Url.Contains(m.UrlSubstring, StringComparison.OrdinalIgnoreCase));
+                        if (match != null && !activeSessions.Any(s => s.Config.Name == match.Name))
+                            activeSessions.Add((Page: page, Config: match));
+                    }
+                    catch (Exception ex)
+                    {
+                        AnsiConsole.MarkupLine($"[grey]Skipped a page (possibly closed): {Markup.Escape(ex.Message)}[/]");
+                    }
                 }
 
                 if (activeSessions.Count == 0)
@@ -325,7 +351,22 @@ namespace CliFileInjector
                 {
                     string fileName = Path.GetFileName(filePath);
                     bool isText = IsTextFile(filePath);
-                    string content = isText ? File.ReadAllText(filePath) : string.Empty;
+                    string content = string.Empty;
+
+                    if (isText)
+                    {
+                        try
+                        {
+                            content = File.ReadAllText(filePath);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        {
+                            AnsiConsole.MarkupLine(
+                                $"[yellow]⚠ Skipped '[white]{Markup.Escape(fileName)}[/]': {Markup.Escape(ex.Message)}[/]");
+                            isText = false;
+                        }
+                    }
+
                     fileEntries.Add(new FileEntry(fileName, content, isText));
                 }
 
@@ -373,7 +414,7 @@ namespace CliFileInjector
                         }
                         catch (Exception ex)
                         {
-                            AnsiConsole.MarkupLine($"[red]Error injecting into {target.Config.Name}: {ex.Message}[/]");
+                            AnsiConsole.MarkupLine($"[red]Error injecting into {target.Config.Name}: {Markup.Escape(ex.Message)}[/]");
                         }
                     }
 
@@ -535,7 +576,10 @@ namespace CliFileInjector
         {
             using var window = new Form();
             var handle = window.Handle;
-            RegisterHotKey(handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_F);
+
+            if (!RegisterHotKey(handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_F))
+                AnsiConsole.MarkupLine("[yellow]⚠ Failed to register global hotkey (Ctrl+Alt+F). It may be in use by another application.[/]");
+
             System.Windows.Forms.Application.AddMessageFilter(new HotKeyMessageFilter());
             System.Windows.Forms.Application.Run();
             UnregisterHotKey(handle, HOTKEY_ID);
@@ -583,19 +627,35 @@ namespace CliFileInjector
                     AnsiConsole.MarkupLine("\n[grey]Nothing selected yet.[/]");
                 }
 
-                var dirs = Directory.GetDirectories(currentPath)
-                    .Select(Path.GetFileName)
-                    .Where(x => !string.IsNullOrWhiteSpace(x))
-                    .Select(x => x!)
-                    .OrderBy(x => x)
-                    .ToList();
+                List<string> dirs, files;
+                try
+                {
+                    dirs = Directory.GetDirectories(currentPath)
+                        .Select(Path.GetFileName)
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Select(x => x!)
+                        .OrderBy(x => x)
+                        .ToList();
 
-                var files = Directory.GetFiles(currentPath)
-                    .Select(Path.GetFileName)
-                    .Where(x => !string.IsNullOrWhiteSpace(x))
-                    .Select(x => x!)
-                    .OrderBy(x => x)
-                    .ToList();
+                    files = Directory.GetFiles(currentPath)
+                        .Select(Path.GetFileName)
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Select(x => x!)
+                        .OrderBy(x => x)
+                        .ToList();
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    AnsiConsole.MarkupLine($"[red]Cannot read directory: {Markup.Escape(ex.Message)}[/]");
+                    AnsiConsole.MarkupLine("[grey]Press any key to go back...[/]");
+                    Console.ReadKey(intercept: true);
+
+                    var parent = Directory.GetParent(currentPath);
+                    if (parent != null)
+                        currentPath = parent.FullName;
+
+                    continue;
+                }
 
                 var displayToFile = new Dictionary<string, string>();
                 var choices = new List<string>();
@@ -649,12 +709,26 @@ namespace CliFileInjector
                     {
                         if (Directory.Exists(path))
                         {
-                            foreach (var f in Directory.GetFiles(path, "*.*", SearchOption.AllDirectories))
+                            IEnumerable<string> enumerated;
+                            try
+                            {
+                                enumerated = Directory.GetFiles(path, "*.*", SearchOption.AllDirectories);
+                            }
+                            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                            {
+                                AnsiConsole.MarkupLine($"[yellow]⚠ Partial read of '[white]{Markup.Escape(Path.GetFileName(path))}[/]': {Markup.Escape(ex.Message)}[/]");
+                                enumerated = SafeEnumerateFiles(path, directoryFilterPatterns);
+                            }
+
+                            foreach (var f in enumerated)
                             {
                                 if (!IsTextFile(f))
                                     continue;
 
                                 if (!MatchesDirectoryFilter(f, directoryFilterPatterns))
+                                    continue;
+
+                                if (!File.Exists(f))
                                     continue;
 
                                 finalFiles.Add(f);
@@ -705,6 +779,42 @@ namespace CliFileInjector
                             cart.Remove(fullPath);
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Recursively enumerates files, skipping subdirectories that deny access.
+        /// Used as a fallback when Directory.GetFiles(AllDirectories) throws.
+        /// </summary>
+        private static IEnumerable<string> SafeEnumerateFiles(string rootPath, List<string> directoryFilterPatterns)
+        {
+            var pending = new Stack<string>();
+            pending.Push(rootPath);
+
+            while (pending.Count > 0)
+            {
+                string current = pending.Pop();
+
+                IEnumerable<string> subFiles = Enumerable.Empty<string>();
+                IEnumerable<string> subDirs = Enumerable.Empty<string>();
+
+                try { subFiles = Directory.GetFiles(current); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    AnsiConsole.MarkupLine($"[grey]  Skipped (no access): {Markup.Escape(current)}[/]");
+                }
+
+                foreach (var f in subFiles)
+                    yield return f;
+
+                try { subDirs = Directory.GetDirectories(current); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    AnsiConsole.MarkupLine($"[grey]  Skipped subdirs (no access): {Markup.Escape(current)}[/]");
+                }
+
+                foreach (var d in subDirs)
+                    pending.Push(d);
             }
         }
 
