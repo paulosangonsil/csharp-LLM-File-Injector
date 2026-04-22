@@ -1,9 +1,12 @@
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Playwright;
 using Spectre.Console;
+using System.Windows.Forms;
 
 namespace CliFileInjector
 {
@@ -13,23 +16,288 @@ namespace CliFileInjector
         public string UrlSubstring { get; set; } = string.Empty;
         public string TextAreaSelector { get; set; } = string.Empty;
         public bool UsesContentEditable { get; set; }
+        public string HomeUrl { get; set; } = string.Empty;
+    }
+
+    public class CdpVersionInfo
+    {
+        public string Browser { get; set; } = string.Empty;
+        public string ProtocolVersion { get; set; } = string.Empty;
+        public string UserAgent { get; set; } = string.Empty;
+        public string V8Version { get; set; } = string.Empty;
+        public string WebKitVersion { get; set; } = string.Empty;
+        public string WebSocketDebuggerUrl { get; set; } = string.Empty;
+    }
+
+    public class CdpEndpointCandidate
+    {
+        public string Name { get; set; } = string.Empty;
+        public string VersionEndpointUrl { get; set; } = string.Empty;
+    }
+
+    public class CdpSettings
+    {
+        public int RetryCount { get; set; } = 3;
+        public int RetryDelayMilliseconds { get; set; } = 350;
+        public List<CdpEndpointCandidate> EndpointCandidates { get; set; } = new();
+    }
+
+    public class BrowserLaunchSettings
+    {
+        public bool EnableLaunchFallback { get; set; } = true;
+        public string Channel { get; set; } = "msedge";
+        public bool Headless { get; set; }
+        public List<string> Arguments { get; set; } = new();
+    }
+
+    public class OperationalSettings
+    {
+        public bool EnableGlobalHotkey { get; set; }
+        public int MaxChunkBytes { get; set; } = 37 * 1024;
+    }
+
+    public class AppRuntimeOptions
+    {
+        public bool DiagnoseCdp { get; set; }
+        public string WorkingDirectory { get; set; } = string.Empty;
+    }
+
+    public class BrowserSessionInfo
+    {
+        public IBrowser Browser { get; set; } = null!;
+        public IBrowserContext Context { get; set; } = null!;
+        public string ConnectionMode { get; set; } = string.Empty;
+        public bool IsFallbackLaunched { get; set; }
+    }
+
+    public class BuildRuntimeOptionsParams
+    {
+        public string[] Args { get; set; } = Array.Empty<string>();
+    }
+
+    public class NormalizeCdpSettingsParams
+    {
+        public CdpSettings? Settings { get; set; }
+    }
+
+    public class NormalizeBrowserLaunchSettingsParams
+    {
+        public BrowserLaunchSettings? Settings { get; set; }
+    }
+
+    public class NormalizeOperationalSettingsParams
+    {
+        public OperationalSettings? Settings { get; set; }
+    }
+
+    public class ResolveCdpVersionInfoParams
+    {
+        public HttpClient HttpClient { get; set; } = null!;
+        public string VersionEndpointUrl { get; set; } = string.Empty;
+    }
+
+    public class ConnectToCdpParams
+    {
+        public IPlaywright Playwright { get; set; } = null!;
+        public CdpSettings Settings { get; set; } = null!;
+    }
+
+    public class DiagnoseCdpParams
+    {
+        public IPlaywright Playwright { get; set; } = null!;
+        public CdpSettings Settings { get; set; } = null!;
+    }
+
+    public class LaunchBrowserParams
+    {
+        public IPlaywright Playwright { get; set; } = null!;
+        public BrowserLaunchSettings Settings { get; set; } = null!;
+    }
+
+    public class ConnectBrowserSessionParams
+    {
+        public IPlaywright Playwright { get; set; } = null!;
+        public CdpSettings CdpSettings { get; set; } = null!;
+        public BrowserLaunchSettings BrowserLaunchSettings { get; set; } = null!;
+    }
+
+    public class EnsureSupportedSessionParams
+    {
+        public BrowserSessionInfo BrowserSession { get; set; } = null!;
+        public IBrowserContext Context { get; set; } = null!;
+        public List<LlmConfig> SupportedModels { get; set; } = new();
+    }
+
+    internal static class CdpConnector
+    {
+        public static async Task<IBrowser> ConnectToEdgeAsync(ConnectToCdpParams parameters)
+        {
+            using var httpClient = new HttpClient();
+
+            Exception? lastException = null;
+            int retryCount = Math.Max(1, parameters.Settings.RetryCount), retryDelayMilliseconds = Math.Max(0, parameters.Settings.RetryDelayMilliseconds);
+
+            foreach (var candidate in parameters.Settings.EndpointCandidates)
+            {
+                for (int attemptIndex = 0; attemptIndex < retryCount; attemptIndex++)
+                {
+                    try
+                    {
+                        AnsiConsole.MarkupLine(
+                            $"[grey]CDP probe:[/] {Markup.Escape(candidate.Name)} -> {Markup.Escape(candidate.VersionEndpointUrl)} (attempt {attemptIndex + 1}/{retryCount})");
+
+                        var versionInfo = await ResolveVersionInfoAsync(new ResolveCdpVersionInfoParams
+                        {
+                            HttpClient = httpClient,
+                            VersionEndpointUrl = candidate.VersionEndpointUrl
+                        });
+
+                        AnsiConsole.MarkupLine($"[grey]CDP browser:[/] {Markup.Escape(versionInfo.Browser)}");
+                        AnsiConsole.MarkupLine($"[grey]CDP websocket:[/] {Markup.Escape(versionInfo.WebSocketDebuggerUrl)}");
+
+                        return await parameters.Playwright.Chromium.ConnectOverCDPAsync(versionInfo.WebSocketDebuggerUrl);
+                    }
+                    catch (Exception ex)
+                    {
+                        lastException = ex;
+                        AnsiConsole.MarkupLine(
+                            $"[yellow]CDP attach failed via {Markup.Escape(candidate.Name)} (attempt {attemptIndex + 1}/{retryCount}): {Markup.Escape(ex.Message)}[/]");
+
+                        if (attemptIndex < retryCount - 1 && retryDelayMilliseconds > 0)
+                            await Task.Delay(retryDelayMilliseconds);
+                    }
+                }
+            }
+
+            throw new InvalidOperationException(
+                "Could not attach to Edge via any configured CDP endpoint.",
+                lastException);
+        }
+
+        public static async Task DiagnoseAsync(DiagnoseCdpParams parameters)
+        {
+            using var httpClient = new HttpClient();
+
+            foreach (var candidate in parameters.Settings.EndpointCandidates)
+            {
+                AnsiConsole.Write(new Rule($"CDP diagnose: {candidate.Name}").RuleStyle("grey"));
+
+                try
+                {
+                    var versionInfo = await ResolveVersionInfoAsync(new ResolveCdpVersionInfoParams
+                    {
+                        HttpClient = httpClient,
+                        VersionEndpointUrl = candidate.VersionEndpointUrl
+                    });
+
+                    AnsiConsole.MarkupLine($"[green]Version endpoint reachable:[/] {Markup.Escape(candidate.VersionEndpointUrl)}");
+                    AnsiConsole.MarkupLine($"[grey]Browser:[/] {Markup.Escape(versionInfo.Browser)}");
+                    AnsiConsole.MarkupLine($"[grey]Protocol-Version:[/] {Markup.Escape(versionInfo.ProtocolVersion)}");
+                    AnsiConsole.MarkupLine($"[grey]webSocketDebuggerUrl:[/] {Markup.Escape(versionInfo.WebSocketDebuggerUrl)}");
+
+                    try
+                    {
+                        await using var browser = await parameters.Playwright.Chromium.ConnectOverCDPAsync(versionInfo.WebSocketDebuggerUrl);
+                        int contextCount = browser.Contexts.Count;
+                        int pageCount = browser.Contexts.Sum(x => x.Pages.Count);
+
+                        AnsiConsole.MarkupLine($"[green]Attach OK.[/] Contexts: {contextCount}, Pages: {pageCount}");
+                    }
+                    catch (Exception ex)
+                    {
+                        AnsiConsole.MarkupLine($"[red]Attach failed:[/] {Markup.Escape(ex.Message)}");
+
+                        Exception? inner = ex.InnerException;
+                        while (inner != null)
+                        {
+                            AnsiConsole.MarkupLine($"[grey]  Inner:[/] {Markup.Escape(inner.Message)}");
+                            inner = inner.InnerException;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AnsiConsole.MarkupLine($"[red]Version endpoint failed:[/] {Markup.Escape(ex.Message)}");
+                }
+            }
+        }
+
+        private static async Task<CdpVersionInfo> ResolveVersionInfoAsync(ResolveCdpVersionInfoParams parameters)
+        {
+            using var response = await parameters.HttpClient.GetAsync(parameters.VersionEndpointUrl);
+            response.EnsureSuccessStatusCode();
+
+            string json = await response.Content.ReadAsStringAsync();
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+
+            string browser = TryGetString(root, "Browser");
+            string protocolVersion = TryGetString(root, "Protocol-Version");
+            string userAgent = TryGetString(root, "User-Agent");
+            string v8Version = TryGetString(root, "V8-Version");
+            string webKitVersion = TryGetString(root, "WebKit-Version");
+            string webSocketDebuggerUrl = TryGetString(root, "webSocketDebuggerUrl");
+
+            if (string.IsNullOrWhiteSpace(webSocketDebuggerUrl))
+                throw new InvalidOperationException("CDP endpoint did not return webSocketDebuggerUrl.");
+
+            return new CdpVersionInfo
+            {
+                Browser = browser,
+                ProtocolVersion = protocolVersion,
+                UserAgent = userAgent,
+                V8Version = v8Version,
+                WebKitVersion = webKitVersion,
+                WebSocketDebuggerUrl = webSocketDebuggerUrl
+            };
+        }
+
+        private static string TryGetString(JsonElement root, string propertyName)
+        {
+            if (!root.TryGetProperty(propertyName, out var value))
+                return string.Empty;
+
+            if (value.ValueKind != JsonValueKind.String)
+                return string.Empty;
+
+            return value.GetString() ?? string.Empty;
+        }
+    }
+
+    internal static class BrowserLauncher
+    {
+        public static async Task<BrowserSessionInfo> LaunchAsync(LaunchBrowserParams parameters)
+        {
+            var launchOptions = new BrowserTypeLaunchOptions
+            {
+                Channel = string.IsNullOrWhiteSpace(parameters.Settings.Channel) ? "msedge" : parameters.Settings.Channel,
+                Headless = parameters.Settings.Headless
+            };
+
+            if (parameters.Settings.Arguments != null && parameters.Settings.Arguments.Count > 0)
+                launchOptions.Args = parameters.Settings.Arguments;
+
+            var browser = await parameters.Playwright.Chromium.LaunchAsync(launchOptions);
+            var context = await browser.NewContextAsync();
+            var page = await context.NewPageAsync();
+            await page.GotoAsync("about:blank");
+
+            return new BrowserSessionInfo
+            {
+                Browser = browser,
+                Context = context,
+                ConnectionMode = $"Launched via Playwright ({launchOptions.Channel})",
+                IsFallbackLaunched = true
+            };
+        }
     }
 
     class Program
     {
-        // ------------------------------------------------------------------
-        // Feature Flag: enable or disable global hotkey (Ctrl + Alt + F)
-        // ------------------------------------------------------------------
-        private static readonly bool ENABLE_GLOBAL_HOTKEY = false;
+        private static bool _enableGlobalHotkey = false;
+        private static int _maxChunkBytes = 37 * 1024;
+        private static bool _hotkeyTriggered = false;
 
-        // ------------------------------------------------------------------
-        // Chunk size limit for injection (in bytes, UTF-8)
-        // ------------------------------------------------------------------
-        private const int MAX_CHUNK_BYTES = 37 * 1024; // 37 KB
-
-        // ------------------------------------------------------------------
-        // P/INVOKE AND WIN32 API (For Global Hotkey and Foreground Window)
-        // ------------------------------------------------------------------
         [DllImport("user32.dll")]
         private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
 
@@ -45,12 +313,9 @@ namespace CliFileInjector
 
         private const uint MOD_ALT = 0x0001;
         private const uint MOD_CONTROL = 0x0002;
-        private const uint VK_F = 0x46; // F key
+        private const uint VK_F = 0x46;
         private const int HOTKEY_ID = 9000;
 
-        // ------------------------------------------------------------------
-        // FILE RULES
-        // ------------------------------------------------------------------
         private static readonly HashSet<string> TextExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
             ".cs", ".cpp", ".c", ".h", ".hpp",
@@ -68,11 +333,6 @@ namespace CliFileInjector
             ".pdb", ".obj"
         };
 
-        private static bool _hotkeyTriggered = false;
-
-        // ------------------------------------------------------------------
-        // CHUNK BUILDER
-        // ------------------------------------------------------------------
         private record FileEntry(string FileName, string Content, bool IsText);
 
         private static int Utf8Bytes(string s) => Encoding.UTF8.GetByteCount(s);
@@ -85,18 +345,16 @@ namespace CliFileInjector
             {
                 if (!entry.IsText)
                 {
-                    allSegments.Add(
-                        $"[Context Note: The binary/non-text file '{entry.FileName}' exists in the directory, but its content was omitted.]\n\n");
+                    allSegments.Add($"[Context Note: The binary/non-text file '{entry.FileName}' exists in the directory, but its content was omitted.]\n\n");
                     continue;
                 }
 
                 string fileContent = entry.Content.Replace("\r\n", "\n");
-
                 string worstHeader = $"--- Start of '{entry.FileName}' (part 999 of 999) ---\n";
                 string worstFooter = $"\n--- End of '{entry.FileName}' (part 999 of 999) ---\n\n";
                 int markerBytes = Utf8Bytes(worstHeader) + Utf8Bytes(worstFooter);
-                int budget = MAX_CHUNK_BYTES - markerBytes;
-                if (budget <= 0) budget = MAX_CHUNK_BYTES / 2;
+                int budget = _maxChunkBytes - markerBytes;
+                if (budget <= 0) budget = _maxChunkBytes / 2;
 
                 var groups = new List<string>();
                 var cur = new StringBuilder();
@@ -168,14 +426,14 @@ namespace CliFileInjector
             {
                 int segBytes = Utf8Bytes(seg);
 
-                if (segBytes > MAX_CHUNK_BYTES)
+                if (segBytes > _maxChunkBytes)
                 {
                     Flush();
                     chunks.Add(seg);
                     continue;
                 }
 
-                if (chunkBytes + segBytes > MAX_CHUNK_BYTES)
+                if (chunkBytes + segBytes > _maxChunkBytes)
                     Flush();
 
                 chunkBuilder.Append(seg);
@@ -203,27 +461,15 @@ namespace CliFileInjector
             Console.OutputEncoding = Encoding.UTF8;
             Console.InputEncoding = Encoding.UTF8;
 
-            string workingDirectory =
-                args.Length > 0 && Directory.Exists(args[0])
-                    ? args[0]
-                    : Directory.GetCurrentDirectory();
+            var runtimeOptions = BuildRuntimeOptions(new BuildRuntimeOptionsParams
+            {
+                Args = args
+            });
 
+            string workingDirectory = runtimeOptions.WorkingDirectory;
             string lastBrowserDirectory = workingDirectory;
             string exeDirectory = AppDomain.CurrentDomain.BaseDirectory;
             List<string> directoryFilterPatterns = new();
-
-            Thread? hookThread = null;
-            if (ENABLE_GLOBAL_HOTKEY)
-            {
-                hookThread = new Thread(RegisterGlobalHotKey);
-                hookThread.SetApartmentState(ApartmentState.STA);
-                hookThread.Start();
-                AnsiConsole.MarkupLine("[green]Global hotkey (Ctrl+Alt+F) is ENABLED.[/]");
-            }
-            else
-            {
-                AnsiConsole.MarkupLine("[yellow]Global hotkey is DISABLED. Use Enter in the console instead.[/]");
-            }
 
             IConfiguration config = new ConfigurationBuilder()
                 .SetBasePath(exeDirectory)
@@ -237,37 +483,78 @@ namespace CliFileInjector
                 return;
             }
 
-            AnsiConsole.MarkupLine("[blue]Connecting to Edge via CDP (port 9222)...[/]");
+            var cdpSettings = NormalizeCdpSettings(new NormalizeCdpSettingsParams
+            {
+                Settings = config.GetSection("Cdp").Get<CdpSettings>()
+            });
+
+            var browserLaunchSettings = NormalizeBrowserLaunchSettings(new NormalizeBrowserLaunchSettingsParams
+            {
+                Settings = config.GetSection("BrowserLaunch").Get<BrowserLaunchSettings>()
+            });
+
+            var operationalSettings = NormalizeOperationalSettings(new NormalizeOperationalSettingsParams
+            {
+                Settings = config.GetSection("Operational").Get<OperationalSettings>()
+            });
+
+            _enableGlobalHotkey = operationalSettings.EnableGlobalHotkey;
+            _maxChunkBytes = operationalSettings.MaxChunkBytes;
 
             using var playwright = await Playwright.CreateAsync();
-            IBrowser browser;
+
+            if (runtimeOptions.DiagnoseCdp)
+            {
+                AnsiConsole.MarkupLine("[blue]CDP diagnose mode enabled.[/]");
+                await CdpConnector.DiagnoseAsync(new DiagnoseCdpParams
+                {
+                    Playwright = playwright,
+                    Settings = cdpSettings
+                });
+                return;
+            }
+
+            Thread? hookThread = null;
+            if (_enableGlobalHotkey)
+            {
+                hookThread = new Thread(RegisterGlobalHotKey);
+                hookThread.SetApartmentState(ApartmentState.STA);
+                hookThread.Start();
+                AnsiConsole.MarkupLine("[green]Global hotkey (Ctrl+Alt+F) is ENABLED.[/]");
+            }
+            else
+            {
+                AnsiConsole.MarkupLine("[yellow]Global hotkey is DISABLED. Use Enter in the console instead.[/]");
+            }
+
+            AnsiConsole.MarkupLine("[blue]Connecting to Edge via CDP first, with optional Playwright launch fallback...[/]");
+
+            BrowserSessionInfo browserSession;
             try
             {
-                browser = await playwright.Chromium.ConnectOverCDPAsync("http://localhost:9222");
+                browserSession = await ConnectBrowserSessionAsync(new ConnectBrowserSessionParams
+                {
+                    Playwright = playwright,
+                    CdpSettings = cdpSettings,
+                    BrowserLaunchSettings = browserLaunchSettings
+                });
             }
             catch (Exception ex)
             {
-                AnsiConsole.MarkupLine("[red]Failed to connect to Edge via CDP.[/]");
-                AnsiConsole.MarkupLine("[grey]Make sure Edge is running with --remote-debugging-port=9222.[/]");
+                AnsiConsole.MarkupLine("[red]Failed to establish a usable browser session.[/]");
                 AnsiConsole.MarkupLine($"[red]Details: {Markup.Escape(ex.Message)}[/]");
                 return;
             }
 
-            if (browser.Contexts.Count == 0)
-            {
-                AnsiConsole.MarkupLine("[red]No browser contexts found. Open at least one tab in Edge and try again.[/]");
-                return;
-            }
+            var context = browserSession.Context;
 
-            var context = browser.Contexts[0];
-
-            AnsiConsole.MarkupLine("[green]Service ready.[/]");
-            if (ENABLE_GLOBAL_HOTKEY)
+            AnsiConsole.MarkupLine($"[green]Service ready.[/] [grey]Mode:[/] {Markup.Escape(browserSession.ConnectionMode)}");
+            if (_enableGlobalHotkey)
                 AnsiConsole.MarkupLine("Press [yellow]Ctrl + Alt + F[/] from anywhere to inject files.");
 
             while (true)
             {
-                if (ENABLE_GLOBAL_HOTKEY)
+                if (_enableGlobalHotkey)
                 {
                     if (!_hotkeyTriggered)
                     {
@@ -317,7 +604,20 @@ namespace CliFileInjector
 
                 if (activeSessions.Count == 0)
                 {
-                    AnsiConsole.MarkupLine("[red]No supported LLM (ChatGPT, Claude, etc.) open in Edge.[/]");
+                    bool openedFromFallback = await EnsureSupportedSessionAsync(new EnsureSupportedSessionParams
+                    {
+                        BrowserSession = browserSession,
+                        Context = context,
+                        SupportedModels = supportedModels
+                    });
+
+                    if (openedFromFallback)
+                    {
+                        AnsiConsole.MarkupLine("[yellow]A provider page was opened in the launched browser. Sign in if needed, then trigger the injector again.[/]");
+                        continue;
+                    }
+
+                    AnsiConsole.MarkupLine("[red]No supported LLM (ChatGPT, Claude, etc.) open in the current browser context.[/]");
                     continue;
                 }
 
@@ -341,10 +641,7 @@ namespace CliFileInjector
                     continue;
                 }
 
-                lastBrowserDirectory = ResolveNextBrowserDirectory(
-                    selectedFilePaths,
-                    lastVisitedDirectory,
-                    lastBrowserDirectory);
+                lastBrowserDirectory = ResolveNextBrowserDirectory(selectedFilePaths, lastVisitedDirectory, lastBrowserDirectory);
 
                 var fileEntries = new List<FileEntry>();
                 foreach (var filePath in selectedFilePaths)
@@ -361,8 +658,7 @@ namespace CliFileInjector
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                         {
-                            AnsiConsole.MarkupLine(
-                                $"[yellow]⚠ Skipped '[white]{Markup.Escape(fileName)}[/]': {Markup.Escape(ex.Message)}[/]");
+                            AnsiConsole.MarkupLine($"[yellow]⚠ Skipped '[white]{Markup.Escape(fileName)}[/]': {Markup.Escape(ex.Message)}[/]");
                             isText = false;
                         }
                     }
@@ -374,7 +670,7 @@ namespace CliFileInjector
                 int totalChunks = chunks.Count;
 
                 if (totalChunks > 1)
-                    AnsiConsole.MarkupLine($"[yellow]Payload exceeds {MAX_CHUNK_BYTES / 1024} KB — will be sent in {totalChunks} chunk(s).[/]");
+                    AnsiConsole.MarkupLine($"[yellow]Payload exceeds {_maxChunkBytes / 1024} KB — will be sent in {totalChunks} chunk(s).[/]");
 
                 var targets = new List<(IPage Page, LlmConfig Config)>();
                 if (activeSessions.Count == 1)
@@ -422,8 +718,7 @@ namespace CliFileInjector
                     {
                         SetForegroundWindow(GetConsoleWindow());
                         AnsiConsole.MarkupLine(
-                            $"\n[yellow]Chunk {chunkIndex + 1}/{totalChunks} injected.[/] " +
-                            "Press [green]Enter[/] to send the next chunk, or [red]Esc[/] to abort.");
+                            $"\n[yellow]Chunk {chunkIndex + 1}/{totalChunks} injected.[/] Press [green]Enter[/] to send the next chunk, or [red]Esc[/] to abort.");
 
                         bool aborted = false;
                         while (true)
@@ -449,10 +744,168 @@ namespace CliFileInjector
             }
         }
 
-        private static string ResolveNextBrowserDirectory(
-            List<string> selectedFilePaths,
-            string lastVisitedDirectory,
-            string fallbackDirectory)
+        private static async Task<BrowserSessionInfo> ConnectBrowserSessionAsync(ConnectBrowserSessionParams parameters)
+        {
+            try
+            {
+                var browser = await CdpConnector.ConnectToEdgeAsync(new ConnectToCdpParams
+                {
+                    Playwright = parameters.Playwright,
+                    Settings = parameters.CdpSettings
+                });
+
+                if (browser.Contexts.Count == 0)
+                    throw new InvalidOperationException("Connected over CDP, but no browser contexts were found.");
+
+                return new BrowserSessionInfo
+                {
+                    Browser = browser,
+                    Context = browser.Contexts[0],
+                    ConnectionMode = "Attached to existing Edge via CDP",
+                    IsFallbackLaunched = false
+                };
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine("[yellow]CDP attach was not successful.[/]");
+                AnsiConsole.MarkupLine($"[yellow]Reason:[/] {Markup.Escape(ex.Message)}");
+
+                Exception? inner = ex.InnerException;
+                while (inner != null)
+                {
+                    AnsiConsole.MarkupLine($"[grey]Inner:[/] {Markup.Escape(inner.Message)}");
+                    inner = inner.InnerException;
+                }
+
+                if (!parameters.BrowserLaunchSettings.EnableLaunchFallback)
+                    throw;
+
+                bool shouldLaunch = AnsiConsole.Confirm(
+                    "CDP attach failed. Launch a new Microsoft Edge instance controlled by Playwright instead?",
+                    true);
+
+                if (!shouldLaunch)
+                    throw;
+
+                AnsiConsole.MarkupLine("[blue]Launching a new Edge instance via Playwright...[/]");
+
+                return await BrowserLauncher.LaunchAsync(new LaunchBrowserParams
+                {
+                    Playwright = parameters.Playwright,
+                    Settings = parameters.BrowserLaunchSettings
+                });
+            }
+        }
+
+        private static async Task<bool> EnsureSupportedSessionAsync(EnsureSupportedSessionParams parameters)
+        {
+            if (!parameters.BrowserSession.IsFallbackLaunched)
+                return false;
+
+            var candidates = parameters.SupportedModels
+                .Where(x => !string.IsNullOrWhiteSpace(x.HomeUrl))
+                .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (candidates.Count == 0)
+                return false;
+
+            var choices = candidates.Select(x => x.Name).ToList();
+            choices.Add("Skip for now");
+
+            var selectedName = AnsiConsole.Prompt(
+                new SelectionPrompt<string>()
+                    .Title("No supported provider page is open. Which provider should be opened in the launched browser?")
+                    .AddChoices(choices));
+
+            if (selectedName == "Skip for now")
+                return false;
+
+            var selectedProvider = candidates.First(x => x.Name == selectedName);
+            var page = parameters.Context.Pages.FirstOrDefault() ?? await parameters.Context.NewPageAsync();
+            await page.GotoAsync(selectedProvider.HomeUrl);
+            return true;
+        }
+
+        private static AppRuntimeOptions BuildRuntimeOptions(BuildRuntimeOptionsParams parameters)
+        {
+            var options = new AppRuntimeOptions();
+
+            foreach (string arg in parameters.Args)
+            {
+                if (arg.Equals("--diagnose-cdp", StringComparison.OrdinalIgnoreCase))
+                {
+                    options.DiagnoseCdp = true;
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(options.WorkingDirectory) && Directory.Exists(arg))
+                    options.WorkingDirectory = arg;
+            }
+
+            if (string.IsNullOrWhiteSpace(options.WorkingDirectory))
+                options.WorkingDirectory = Directory.GetCurrentDirectory();
+
+            return options;
+        }
+
+        private static CdpSettings NormalizeCdpSettings(NormalizeCdpSettingsParams parameters)
+        {
+            CdpSettings settings = parameters.Settings ?? new CdpSettings();
+
+            if (settings.RetryCount <= 0)
+                settings.RetryCount = 3;
+
+            if (settings.RetryDelayMilliseconds < 0)
+                settings.RetryDelayMilliseconds = 350;
+
+            if (settings.EndpointCandidates == null || settings.EndpointCandidates.Count == 0)
+            {
+                settings.EndpointCandidates = new List<CdpEndpointCandidate>
+                {
+                    new CdpEndpointCandidate { Name = "localhost", VersionEndpointUrl = "http://localhost:9222/json/version" },
+                    new CdpEndpointCandidate { Name = "127.0.0.1", VersionEndpointUrl = "http://127.0.0.1:9222/json/version" }
+                };
+            }
+
+            settings.EndpointCandidates = settings.EndpointCandidates
+                .Where(x => x != null)
+                .Select(x => new CdpEndpointCandidate
+                {
+                    Name = string.IsNullOrWhiteSpace(x.Name) ? "unnamed" : x.Name,
+                    VersionEndpointUrl = x.VersionEndpointUrl?.Trim() ?? string.Empty
+                })
+                .Where(x => !string.IsNullOrWhiteSpace(x.VersionEndpointUrl))
+                .ToList();
+
+            if (settings.EndpointCandidates.Count == 0)
+                settings.EndpointCandidates.Add(new CdpEndpointCandidate { Name = "localhost", VersionEndpointUrl = "http://localhost:9222/json/version" });
+
+            return settings;
+        }
+
+        private static BrowserLaunchSettings NormalizeBrowserLaunchSettings(NormalizeBrowserLaunchSettingsParams parameters)
+        {
+            BrowserLaunchSettings settings = parameters.Settings ?? new BrowserLaunchSettings();
+
+            if (string.IsNullOrWhiteSpace(settings.Channel))
+                settings.Channel = "msedge";
+
+            settings.Arguments ??= new List<string>();
+            return settings;
+        }
+
+        private static OperationalSettings NormalizeOperationalSettings(NormalizeOperationalSettingsParams parameters)
+        {
+            OperationalSettings settings = parameters.Settings ?? new OperationalSettings();
+
+            if (settings.MaxChunkBytes <= 0)
+                settings.MaxChunkBytes = 37 * 1024;
+
+            return settings;
+        }
+
+        private static string ResolveNextBrowserDirectory(List<string> selectedFilePaths, string lastVisitedDirectory, string fallbackDirectory)
         {
             if (selectedFilePaths == null || selectedFilePaths.Count == 0)
                 return !string.IsNullOrWhiteSpace(lastVisitedDirectory) ? lastVisitedDirectory : fallbackDirectory;
@@ -482,10 +935,7 @@ namespace CliFileInjector
             AnsiConsole.MarkupLine("[grey]Notes:[/] applies only to selected directories; individually selected files always bypass the filter.");
             AnsiConsole.MarkupLine("[grey]Leave empty, or type 'clear' / 'none' to remove the filter.[/]\n");
 
-            string input = AnsiConsole.Prompt(
-                new TextPrompt<string>("Extensions / wildcard list:")
-                    .AllowEmpty());
-
+            string input = AnsiConsole.Prompt(new TextPrompt<string>("Extensions / wildcard list:").AllowEmpty());
             var patterns = ParseDirectoryFilterInput(input);
 
             if (patterns.Count == 0)
@@ -495,7 +945,6 @@ namespace CliFileInjector
 
             AnsiConsole.MarkupLine("[grey]Press any key to return to idle...[/]");
             Console.ReadKey(intercept: true);
-
             return patterns;
         }
 
@@ -505,11 +954,8 @@ namespace CliFileInjector
                 return new List<string>();
 
             string normalized = input.Trim();
-            if (normalized.Equals("clear", StringComparison.OrdinalIgnoreCase) ||
-                normalized.Equals("none", StringComparison.OrdinalIgnoreCase))
-            {
+            if (normalized.Equals("clear", StringComparison.OrdinalIgnoreCase) || normalized.Equals("none", StringComparison.OrdinalIgnoreCase))
                 return new List<string>();
-            }
 
             return normalized
                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -520,9 +966,7 @@ namespace CliFileInjector
 
         private static string FormatDirectoryFilter(List<string> patterns)
         {
-            return patterns == null || patterns.Count == 0
-                ? "<none>"
-                : string.Join(", ", patterns);
+            return patterns == null || patterns.Count == 0 ? "<none>" : string.Join(", ", patterns);
         }
 
         private static bool MatchesDirectoryFilter(string filePath, List<string> patterns)
@@ -531,12 +975,9 @@ namespace CliFileInjector
                 return true;
 
             string fileName = Path.GetFileName(filePath);
-
             foreach (var pattern in patterns)
-            {
                 if (MatchesSinglePattern(fileName, pattern))
                     return true;
-            }
 
             return false;
         }
@@ -547,13 +988,7 @@ namespace CliFileInjector
                 return false;
 
             string normalizedPattern = NormalizeWildcardPattern(pattern);
-            string regexPattern =
-                "^" +
-                Regex.Escape(normalizedPattern)
-                    .Replace("\\*", ".*")
-                    .Replace("\\?", ".") +
-                "$";
-
+            string regexPattern = "^" + Regex.Escape(normalizedPattern).Replace("\\*", ".*").Replace("\\?", ".") + "$";
             return Regex.IsMatch(fileName, regexPattern, RegexOptions.IgnoreCase);
         }
 
@@ -569,9 +1004,6 @@ namespace CliFileInjector
             return p;
         }
 
-        // ------------------------------------------------------------------
-        // WINDOWS MESSAGE PUMP (for global hotkey)
-        // ------------------------------------------------------------------
         private static void RegisterGlobalHotKey()
         {
             using var window = new Form();
@@ -599,12 +1031,7 @@ namespace CliFileInjector
             }
         }
 
-        // ------------------------------------------------------------------
-        // FILE BROWSER AND UTILITIES
-        // ------------------------------------------------------------------
-        private static (List<string> Files, string LastDirectory, bool Cancelled) InteractiveFileBrowser(
-            string startingPath,
-            List<string> directoryFilterPatterns)
+        private static (List<string> Files, string LastDirectory, bool Cancelled) InteractiveFileBrowser(string startingPath, List<string> directoryFilterPatterns)
         {
             string currentPath = startingPath;
             var cart = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -630,19 +1057,8 @@ namespace CliFileInjector
                 List<string> dirs, files;
                 try
                 {
-                    dirs = Directory.GetDirectories(currentPath)
-                        .Select(Path.GetFileName)
-                        .Where(x => !string.IsNullOrWhiteSpace(x))
-                        .Select(x => x!)
-                        .OrderBy(x => x)
-                        .ToList();
-
-                    files = Directory.GetFiles(currentPath)
-                        .Select(Path.GetFileName)
-                        .Where(x => !string.IsNullOrWhiteSpace(x))
-                        .Select(x => x!)
-                        .OrderBy(x => x)
-                        .ToList();
+                    dirs = Directory.GetDirectories(currentPath).Select(Path.GetFileName).Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).OrderBy(x => x).ToList();
+                    files = Directory.GetFiles(currentPath).Select(Path.GetFileName).Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).OrderBy(x => x).ToList();
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
@@ -670,10 +1086,7 @@ namespace CliFileInjector
                 foreach (var dir in dirs)
                 {
                     string fullDir = Path.Combine(currentPath, dir);
-                    string displayed = cart.Contains(fullDir)
-                        ? $"[green]✓ 📁 {dir}[/]"
-                        : $"[blue]📁 {dir}[/]";
-
+                    string displayed = cart.Contains(fullDir) ? $"[green]✓ 📁 {dir}[/]" : $"[blue]📁 {dir}[/]";
                     choices.Add(displayed);
                     displayToFile[displayed] = dir;
                 }
@@ -681,10 +1094,7 @@ namespace CliFileInjector
                 foreach (var file in files)
                 {
                     string fullFile = Path.Combine(currentPath, file);
-                    string displayed = cart.Contains(fullFile)
-                        ? $"[green]✓ 📄 {file}[/]"
-                        : $"📄 {file}";
-
+                    string displayed = cart.Contains(fullFile) ? $"[green]✓ 📄 {file}[/]" : $"📄 {file}";
                     choices.Add(displayed);
                     displayToFile[displayed] = file;
                 }
@@ -724,10 +1134,8 @@ namespace CliFileInjector
                             {
                                 if (!IsTextFile(f))
                                     continue;
-
                                 if (!MatchesDirectoryFilter(f, directoryFilterPatterns))
                                     continue;
-
                                 if (!File.Exists(f))
                                     continue;
 
@@ -782,10 +1190,6 @@ namespace CliFileInjector
             }
         }
 
-        /// <summary>
-        /// Recursively enumerates files, skipping subdirectories that deny access.
-        /// Used as a fallback when Directory.GetFiles(AllDirectories) throws.
-        /// </summary>
         private static IEnumerable<string> SafeEnumerateFiles(string rootPath, List<string> directoryFilterPatterns)
         {
             var pending = new Stack<string>();
@@ -794,7 +1198,6 @@ namespace CliFileInjector
             while (pending.Count > 0)
             {
                 string current = pending.Pop();
-
                 IEnumerable<string> subFiles = Enumerable.Empty<string>();
                 IEnumerable<string> subDirs = Enumerable.Empty<string>();
 
